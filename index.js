@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 5000;
 app.use(express.static("public"));
 
 let lobbies = {}; // { lobbyCode: { players: [], rolesAssigned: false, gameConfig: {}, ... } }
+let gamePauseTimers = {}; // Track pause timers for each lobby
 
 io.on("connection", (socket) => {
   console.log("A user connected:", socket.id);
@@ -26,7 +27,12 @@ io.on("connection", (socket) => {
       dayPhase: false,
       gameOver: false,
       chatMessages: [],
-      mafiaVotes: {} // Track individual mafia kill votes
+      spectatorChatMessages: [],
+      mafiaVotes: {}, // Track individual mafia kill votes
+      isPaused: false,
+      pauseReason: "",
+      currentPhase: null,
+      gameState: {} // Store current game state during pause
     };
 
     socket.join(lobbyCode);
@@ -79,31 +85,48 @@ io.on("connection", (socket) => {
           alivePlayers: lobby.alivePlayers
         });
 
-        // Send current phase state to reconnected player
-        if (lobby.dayPhase) {
-          socket.emit("day-phase", { 
-            eliminated: null, 
-            protected: null, 
-            investigationResults: null,
-            alivePlayers: lobby.alivePlayers,
-            timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null,
-            showNightResults: false
+        // Send spectator data if player is dead
+        if (!lobby.alivePlayers.includes(player.name)) {
+          const allRoles = {};
+          lobby.players.forEach(p => {
+            allRoles[p.name] = p.role;
           });
-          broadcastVoteCounts(lobbyCode, socket.id);
-        } else {
-          // Determine current night phase
-          let currentPhase = "mafia-kill";
-          if (lobby.mafiaActed && !lobby.queenActed && (lobby.gameConfig.queenCount > 0) && hasAliveRole(lobby, "Queen")) {
-            currentPhase = "queen-protect";
-          } else if (lobby.mafiaActed && lobby.queenActed && !lobby.detectiveActed && (lobby.gameConfig.detectiveCount > 0) && hasAliveRole(lobby, "Detective")) {
-            currentPhase = "detective-investigate";
-          }
+          socket.emit("spectator-roles", { allRoles });
+          
+          // Send spectator chat history
+          socket.emit("spectator-chat-history", { messages: lobby.spectatorChatMessages });
+        }
 
-          socket.emit("night-phase", { 
-            phase: currentPhase, 
-            alivePlayers: lobby.alivePlayers,
-            timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null
-          });
+        // Check if game should be resumed after reconnection
+        if (lobby.isPaused) {
+          checkGameResume(lobbyCode);
+        } else {
+          // Send current phase state to reconnected player
+          if (lobby.dayPhase) {
+            socket.emit("day-phase", { 
+              eliminated: null, 
+              protected: null, 
+              investigationResults: null,
+              alivePlayers: lobby.alivePlayers,
+              timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null,
+              showNightResults: false
+            });
+            broadcastVoteCounts(lobbyCode, socket.id);
+          } else {
+            // Determine current night phase
+            let currentPhase = "mafia-kill";
+            if (lobby.mafiaActed && !lobby.queenActed && (lobby.gameConfig.queenCount > 0) && hasAliveRole(lobby, "Queen")) {
+              currentPhase = "queen-protect";
+            } else if (lobby.mafiaActed && lobby.queenActed && !lobby.detectiveActed && (lobby.gameConfig.detectiveCount > 0) && hasAliveRole(lobby, "Detective")) {
+              currentPhase = "detective-investigate";
+            }
+
+            socket.emit("night-phase", { 
+              phase: currentPhase, 
+              alivePlayers: lobby.alivePlayers,
+              timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null
+            });
+          }
         }
       }
       return;
@@ -124,18 +147,34 @@ io.on("connection", (socket) => {
 
     if (allJoined && !lobby.rolesAssigned) {
       assignRoles(lobbyCode);
+    } else if (lobby.rolesAssigned && lobby.isPaused) {
+      // Check if game can be resumed
+      checkGameResume(lobbyCode);
     }
   });
 
   socket.on("night-action", ({ action, target }) => {
     const lobbyCode = socket.lobbyCode;
     const lobby = lobbies[lobbyCode];
-    if (!lobby || lobby.dayPhase || lobby.gameOver) return;
+    if (!lobby || lobby.dayPhase || lobby.gameOver || lobby.isPaused) return;
 
     const player = lobby.players.find(p => p.id === socket.id);
     if (!player || !lobby.alivePlayers.includes(player.name)) return;
 
+    // Prevent duplicate actions from the same player
     if (action === "kill" && player.role === "Mafia") {
+      // Check if this mafia member already voted
+      if (lobby.mafiaVotes[player.name]) {
+        console.log(`Mafia ${player.name} tried to vote again - blocked`);
+        return;
+      }
+      // Validate that target is not another mafia member
+      const targetPlayer = lobby.players.find(p => p.name === target);
+      if (targetPlayer && targetPlayer.role === "Mafia") {
+        console.log(`Mafia ${player.name} attempted to kill another mafia ${target} - blocked`);
+        return; // Block the action
+      }
+      
       // Handle mafia coordination
       lobby.mafiaVotes[player.name] = target;
 
@@ -151,19 +190,19 @@ io.on("connection", (socket) => {
         mafia.socket.emit("mafia-votes-update", { votes: lobby.mafiaVotes });
       });
 
-      // Check if all mafia agree on target
+      // Check if all mafia have voted
       if (mafiaVoteCount === aliveMafia.length) {
         const votes = Object.values(lobby.mafiaVotes);
         const firstVote = votes[0];
-        const allAgree = votes.every(vote => vote === firstVote);
-
-        if (allAgree) {
+        
+        // If only one mafia or all agree on target
+        if (aliveMafia.length === 1 || votes.every(vote => vote === firstVote)) {
           lobby.nightActions.kill = firstVote;
           lobby.mafiaVotes = {}; // Reset for next round
-          console.log(`Mafia agreed on kill target: ${firstVote}`);
+          console.log(`Mafia decided on kill target: ${firstVote}`);
           checkNightPhaseComplete(lobbyCode);
         } else {
-          // Reset votes if no agreement
+          // Reset votes if no agreement (only applies when multiple mafia)
           lobby.mafiaVotes = {};
           aliveMafia.forEach(mafia => {
             mafia.socket.emit("mafia-no-agreement");
@@ -180,7 +219,7 @@ io.on("connection", (socket) => {
   socket.on("vote", ({ target }) => {
     const lobbyCode = socket.lobbyCode;
     const lobby = lobbies[lobbyCode];
-    if (!lobby || !lobby.dayPhase || lobby.gameOver) return;
+    if (!lobby || !lobby.dayPhase || lobby.gameOver || lobby.isPaused) return;
 
     const player = lobby.players.find(p => p.id === socket.id);
     if (!player || !lobby.alivePlayers.includes(player.name)) return;
@@ -200,7 +239,7 @@ io.on("connection", (socket) => {
   socket.on("retract-vote", () => {
     const lobbyCode = socket.lobbyCode;
     const lobby = lobbies[lobbyCode];
-    if (!lobby || !lobby.dayPhase || lobby.gameOver) return;
+    if (!lobby || !lobby.dayPhase || lobby.gameOver || lobby.isPaused) return;
 
     const player = lobby.players.find(p => p.id === socket.id);
     if (!player || !lobby.alivePlayers.includes(player.name)) return;
@@ -224,22 +263,42 @@ io.on("connection", (socket) => {
     // Players must vote for someone before time runs out
   });
 
-  socket.on("send-chat", ({ message }) => {
+  socket.on("send-chat", ({ message, isSpectator = false }) => {
     const lobbyCode = socket.lobbyCode;
     const lobby = lobbies[lobbyCode];
     if (!lobby || lobby.gameOver) return;
 
     const player = lobby.players.find(p => p.id === socket.id);
-    if (!player || !lobby.alivePlayers.includes(player.name)) return;
+    if (!player) return;
 
     const chatMessage = {
       playerName: player.name,
       message: message.trim(),
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      isSpectator: isSpectator
     };
 
-    lobby.chatMessages.push(chatMessage);
-    io.to(lobbyCode).emit("chat-message", chatMessage);
+    if (isSpectator && !lobby.alivePlayers.includes(player.name)) {
+      // Spectator chat - only send to other spectators
+      lobby.spectatorChatMessages.push(chatMessage);
+      
+      // Send to all dead players
+      lobby.players.forEach(p => {
+        if (p.socket && !lobby.alivePlayers.includes(p.name)) {
+          p.socket.emit("spectator-chat-message", chatMessage);
+        }
+      });
+    } else if (!isSpectator && lobby.alivePlayers.includes(player.name)) {
+      // Regular chat - only alive players
+      lobby.chatMessages.push(chatMessage);
+      
+      // Send to all alive players
+      lobby.players.forEach(p => {
+        if (p.socket && lobby.alivePlayers.includes(p.name)) {
+          p.socket.emit("chat-message", chatMessage);
+        }
+      });
+    }
   });
 
   socket.on("replay-game", ({ lobbyCode }) => {
@@ -287,6 +346,18 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
+    
+    // Check if this disconnection should pause any games
+    const lobbyCode = socket.lobbyCode;
+    if (lobbyCode && lobbies[lobbyCode]) {
+      const lobby = lobbies[lobbyCode];
+      const player = lobby.players.find(p => p.id === socket.id);
+      
+      if (player && lobby.rolesAssigned && !lobby.gameOver && lobby.alivePlayers.includes(player.name)) {
+        // Alive player disconnected during active game
+        pauseGame(lobbyCode, player.name);
+      }
+    }
   });
 });
 
@@ -374,6 +445,8 @@ function assignRoles(lobbyCode) {
       allPlayers: players.map(p => p.name),
       alivePlayers: players.map(p => p.name)
     });
+
+    // Send all roles to spectators (dead players don't exist yet at start)
   });
 
   lobby.rolesAssigned = true;
@@ -542,21 +615,45 @@ function checkVotingComplete(lobbyCode) {
   // Find player with most votes
   let eliminated = null;
   let maxVotes = 0;
-  let tieBreaker = false;
+  let tiedPlayers = [];
 
   for (const [player, count] of Object.entries(voteCounts)) {
     if (count > maxVotes) {
       maxVotes = count;
       eliminated = player;
-      tieBreaker = false;
+      tiedPlayers = [player];
     } else if (count === maxVotes && count > 0) {
-      tieBreaker = true;
+      tiedPlayers.push(player);
     }
   }
 
-  // Handle tie - no elimination
-  if (tieBreaker) {
-    eliminated = null;
+  // Handle tie - force revote with only tied players
+  if (tiedPlayers.length > 1 && maxVotes > 0) {
+    lobby.votes = {}; // Reset votes
+    
+    io.to(lobbyCode).emit("vote-tie", {
+      tiedPlayers,
+      votes: voteCounts,
+      message: `Tie between ${tiedPlayers.join(", ")}! Revoting required.`
+    });
+
+    console.log(`Voting tied in lobby ${lobbyCode}. Tied players: ${tiedPlayers.join(", ")}. Starting revote.`);
+
+    // Start new voting round with only tied players as options
+    setTimeout(() => {
+      io.to(lobbyCode).emit("revote-phase", {
+        tiedPlayers,
+        alivePlayers: lobby.alivePlayers,
+        timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null
+      });
+      broadcastVoteCounts(lobbyCode);
+    }, 3000);
+    return;
+  }
+
+  // No tie or no votes - handle elimination
+  if (tiedPlayers.length === 0) {
+    eliminated = null; // No one got any votes
   }
 
   // Get eliminated player's role if showing voted roles is enabled
@@ -638,6 +735,134 @@ function checkWinConditions(lobbyCode) {
   }
 
   return false;
+}
+
+function pauseGame(lobbyCode, playerName) {
+  const lobby = lobbies[lobbyCode];
+  if (!lobby || lobby.isPaused || lobby.gameOver) return;
+
+  lobby.isPaused = true;
+  lobby.pauseReason = `${playerName} disconnected`;
+  
+  // Store current game state
+  lobby.gameState = {
+    currentPhase: lobby.dayPhase ? 'day' : 'night',
+    votes: { ...lobby.votes },
+    nightActions: { ...lobby.nightActions },
+    mafiaVotes: { ...lobby.mafiaVotes }
+  };
+
+  // Notify all players
+  io.to(lobbyCode).emit("game-paused", { 
+    reason: lobby.pauseReason,
+    waitingFor: playerName
+  });
+
+  console.log(`Game paused in lobby ${lobbyCode} - ${playerName} disconnected`);
+
+  // Set a timeout to auto-resume if player doesn't return (10 minutes)
+  if (gamePauseTimers[lobbyCode]) {
+    clearTimeout(gamePauseTimers[lobbyCode]);
+  }
+  
+  gamePauseTimers[lobbyCode] = setTimeout(() => {
+    if (lobbies[lobbyCode] && lobbies[lobbyCode].isPaused) {
+      // Force resume by eliminating the disconnected player
+      forceResumeGame(lobbyCode, playerName);
+    }
+  }, 600000); // 10 minutes
+}
+
+function checkGameResume(lobbyCode) {
+  const lobby = lobbies[lobbyCode];
+  if (!lobby || !lobby.isPaused) return;
+
+  // Check if all alive players are connected
+  const aliveConnected = lobby.alivePlayers.every(playerName => {
+    const player = lobby.players.find(p => p.name === playerName);
+    return player && player.socket && player.socket.connected;
+  });
+
+  if (aliveConnected) {
+    resumeGame(lobbyCode);
+  }
+}
+
+function resumeGame(lobbyCode) {
+  const lobby = lobbies[lobbyCode];
+  if (!lobby || !lobby.isPaused) return;
+
+  lobby.isPaused = false;
+  lobby.pauseReason = "";
+
+  // Clear pause timer
+  if (gamePauseTimers[lobbyCode]) {
+    clearTimeout(gamePauseTimers[lobbyCode]);
+    delete gamePauseTimers[lobbyCode];
+  }
+
+  // Restore game state
+  lobby.votes = lobby.gameState.votes || {};
+  lobby.nightActions = lobby.gameState.nightActions || {};
+  lobby.mafiaVotes = lobby.gameState.mafiaVotes || {};
+
+  // Notify all players
+  io.to(lobbyCode).emit("game-resumed");
+
+  // Resume appropriate phase
+  if (lobby.gameState.currentPhase === 'day') {
+    io.to(lobbyCode).emit("day-phase", { 
+      eliminated: null, 
+      protected: null, 
+      investigationResults: null,
+      alivePlayers: lobby.alivePlayers,
+      timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null,
+      showNightResults: false
+    });
+    broadcastVoteCounts(lobbyCode);
+  } else {
+    // Determine current night phase
+    let currentPhase = "mafia-kill";
+    if (lobby.mafiaActed && !lobby.queenActed && (lobby.gameConfig.queenCount > 0) && hasAliveRole(lobby, "Queen")) {
+      currentPhase = "queen-protect";
+    } else if (lobby.mafiaActed && lobby.queenActed && !lobby.detectiveActed && (lobby.gameConfig.detectiveCount > 0) && hasAliveRole(lobby, "Detective")) {
+      currentPhase = "detective-investigate";
+    }
+
+    io.to(lobbyCode).emit("night-phase", { 
+      phase: currentPhase, 
+      alivePlayers: lobby.alivePlayers,
+      timer: lobby.gameConfig.roundTimer > 0 ? lobby.gameConfig.roundTimer : null
+    });
+  }
+
+  console.log(`Game resumed in lobby ${lobbyCode}`);
+}
+
+function forceResumeGame(lobbyCode, disconnectedPlayer) {
+  const lobby = lobbies[lobbyCode];
+  if (!lobby || !lobby.isPaused) return;
+
+  // Remove disconnected player from alive players
+  lobby.alivePlayers = lobby.alivePlayers.filter(name => name !== disconnectedPlayer);
+
+  // Remove their votes and actions
+  delete lobby.votes[disconnectedPlayer];
+  delete lobby.mafiaVotes[disconnectedPlayer];
+
+  // Notify players
+  io.to(lobbyCode).emit("player-force-eliminated", { 
+    player: disconnectedPlayer,
+    reason: "Disconnected too long"
+  });
+
+  // Check win conditions first
+  if (checkWinConditions(lobbyCode)) {
+    return;
+  }
+
+  // Resume game
+  resumeGame(lobbyCode);
 }
 
 function shuffle(arr) {
