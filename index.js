@@ -1,11 +1,23 @@
 const express = require("express");
 const app = express();
 const http = require("http").createServer(app);
-const io = require("socket.io")(http);
+const io = require("socket.io")(http, {
+  compression: true,
+  pingTimeout: 60000,
+  pingInterval: 25000
+});
 
 const PORT = process.env.PORT || 5000;
 
-app.use(express.static("public"));
+// Performance optimizations
+app.use(express.static("public", {
+  maxAge: '1d', // Cache static files for 1 day
+  etag: true,
+  lastModified: true
+}));
+
+// Disable unnecessary headers
+app.disable('x-powered-by');
 
 let lobbies = {}; // { lobbyCode: { players: [], rolesAssigned: false, gameConfig: {}, ... } }
 let gamePauseTimers = {}; // Track pause timers for each lobby
@@ -209,6 +221,19 @@ io.on("connection", (socket) => {
           });
         }
       }
+      
+      // Special case: if only one mafia alive, immediately process their vote
+      if (aliveMafia.length === 1 && mafiaVoteCount === 1) {
+        const singleVote = Object.values(lobby.mafiaVotes)[0];
+        lobby.nightActions.kill = singleVote;
+        lobby.mafiaVotes = {}; // Reset for next round
+        lobby.mafiaActed = true; // Mark mafia as having acted
+        console.log(`Single mafia decided on kill target: ${singleVote}`);
+        checkNightPhaseComplete(lobbyCode);
+        return; // Exit early to prevent duplicate processing
+      }
+      
+      return; // Exit early for mafia kill actions to prevent duplicate processing
     } else {
       lobby.nightActions[action] = target;
       console.log(`Night action: ${action} on ${target} by ${player.name}`);
@@ -357,6 +382,27 @@ io.on("connection", (socket) => {
         // Alive player disconnected during active game
         pauseGame(lobbyCode, player.name);
       }
+      
+      // Check if all players have disconnected
+      setTimeout(() => {
+        if (lobbies[lobbyCode]) {
+          const allDisconnected = lobbies[lobbyCode].players.every(p => 
+            !p.socket || !p.socket.connected
+          );
+          
+          if (allDisconnected) {
+            console.log(`All players disconnected from lobby ${lobbyCode}, deleting lobby`);
+            
+            // Clear any timers for this lobby
+            if (gamePauseTimers[lobbyCode]) {
+              clearTimeout(gamePauseTimers[lobbyCode]);
+              delete gamePauseTimers[lobbyCode];
+            }
+            
+            delete lobbies[lobbyCode];
+          }
+        }
+      }, 5000); // Wait 5 seconds to allow for quick reconnections
     }
   });
 });
